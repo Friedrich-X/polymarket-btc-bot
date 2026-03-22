@@ -231,6 +231,12 @@ class IntegratedBTCStrategy(Strategy):
         # Paper trading tracker
         self.paper_trades: List[PaperTrade] = []
 
+        # Live P&L tracking
+        self._starting_balance: Optional[Decimal] = None  # Set on first balance update
+        self._current_balance: Decimal = Decimal("0")
+        self._live_trades_count: int = 0
+        self._live_fills: List[Dict] = []  # Track all live fills
+
         self.test_mode = test_mode
 
         if test_mode:
@@ -854,7 +860,7 @@ class IntegratedBTCStrategy(Strategy):
         """
         Make trading decision using our 7-phase system.
 
-        Position size is always $1.00 — no variable sizing, no risk-engine
+        Position size is always $2.00 — no variable sizing, no risk-engine
         calculation needed. The risk engine is still used to check that we
         don't already have too many open positions.
         """
@@ -900,8 +906,8 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
-        # --- Phase 5: Position size is always exactly $1.00 ---
-        POSITION_SIZE_USD = Decimal("1.00")
+        # --- Phase 5: Position size is always exactly $2.00 ---
+        POSITION_SIZE_USD = Decimal("2.00")
 
         # =========================================================================
         # TREND FILTER — replaces signal-based direction at the late trade window
@@ -951,7 +957,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Risk engine blocked trade: {error}")
             return
 
-        logger.info(f"Position size: $1.00 (fixed) | Direction: {direction.upper()}")
+        logger.info(f"Position size: $2.00 (fixed) | Direction: {direction.upper()}")
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
@@ -1246,12 +1252,33 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Failed to track order event '{event_type}': {e}")
 
     def on_order_filled(self, event):
+        fill_price = float(event.last_px)
+        fill_qty = float(event.last_qty)
+        fill_cost = fill_price * fill_qty
+
         logger.info("=" * 80)
         logger.info(f"ORDER FILLED!")
         logger.info(f"  Order: {event.client_order_id}")
-        logger.info(f"  Fill Price: ${float(event.last_px):.4f}")
-        logger.info(f"  Quantity: {float(event.last_qty):.6f}")
+        logger.info(f"  Fill Price: ${fill_price:.4f}")
+        logger.info(f"  Quantity: {fill_qty:.6f}")
+        logger.info(f"  Cost: ${fill_cost:.2f}")
         logger.info("=" * 80)
+
+        # Track live fill for P&L
+        self._live_trades_count += 1
+        self._live_fills.append({
+            "order_id": str(event.client_order_id),
+            "price": fill_price,
+            "qty": fill_qty,
+            "cost": fill_cost,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        # Update Grafana with fill data
+        if self.grafana_exporter:
+            self.grafana_exporter.increment_order_counter("filled")
+            self.grafana_exporter.record_live_fill(fill_price, fill_qty, fill_cost)
+
         self._track_order_event("filled")
 
     def on_order_denied(self, event):
@@ -1274,6 +1301,33 @@ class IntegratedBTCStrategy(Strategy):
             self.last_trade_time = -1  # Allow retry on next quote tick
         else:
             logger.warning(f"Order rejected: {reason}")
+
+    def on_event(self, event):
+        """Handle all events — track balance changes for live P&L."""
+        # Check for AccountState updates (balance changes)
+        event_type = type(event).__name__
+        if event_type == "AccountState":
+            try:
+                balances = getattr(event, 'balances', [])
+                for bal in balances:
+                    total = float(getattr(bal, 'total', 0))
+                    if total > 0:
+                        self._current_balance = Decimal(str(total))
+                        if self._starting_balance is None:
+                            self._starting_balance = self._current_balance
+                            logger.info(f"[P&L] Starting balance: ${total:.2f}")
+
+                        pnl = float(self._current_balance - self._starting_balance)
+                        logger.info(
+                            f"[P&L] Balance: ${total:.2f} | "
+                            f"P&L: ${pnl:+.2f} | "
+                            f"Trades: {self._live_trades_count}"
+                        )
+
+                        if self.grafana_exporter:
+                            self.grafana_exporter.update_live_balance(total)
+            except Exception as e:
+                logger.debug(f"Error processing balance event: {e}")
 
     # ------------------------------------------------------------------
     # Grafana / stop

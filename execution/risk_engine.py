@@ -65,13 +65,13 @@ class RiskEngine:
         Args:
             limits: Risk limits configuration
         """
-        # Default conservative limits with $1 max per trade
+        # Default conservative limits with $2 max per trade
         self.limits = limits or RiskLimits(
-            max_position_size=Decimal("1.0"),  # $1 max per position
-            max_total_exposure=Decimal("10.0"),  # $10 total
+            max_position_size=Decimal("2.0"),  # $2 max per position
+            max_total_exposure=Decimal("20.0"),  # $20 total
             max_positions=5,
             max_drawdown_pct=0.15,  # 15% max drawdown
-            max_loss_per_day=Decimal("5.0"),  # $5 daily loss limit
+            max_loss_per_day=Decimal("10.0"),  # $10 daily loss limit
             max_leverage=1.0,
         )
         

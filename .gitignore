@@ -25,6 +25,7 @@ polymarket_keys.json
 wallet.json
 pk.txt
 private_key.txt
+__pycache__/
 
 # =============================================================================
 # PYTHON

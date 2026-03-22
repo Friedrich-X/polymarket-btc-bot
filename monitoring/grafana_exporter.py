@@ -305,6 +305,47 @@ class GrafanaMetricsExporter:
             'Total orders rejected'
         )
         
+        # Live P&L metrics
+        self.live_pnl = Gauge(
+            'trading_live_pnl',
+            'Live profit/loss from balance changes in USD'
+        )
+
+        self.live_balance = Gauge(
+            'trading_live_balance',
+            'Current Polymarket account balance in USD'
+        )
+
+        self.live_starting_balance = Gauge(
+            'trading_live_starting_balance',
+            'Starting Polymarket balance when bot launched'
+        )
+
+        self.live_total_invested = Gauge(
+            'trading_live_total_invested',
+            'Total USD spent on fills'
+        )
+
+        self.live_fills_count = Counter(
+            'trading_live_fills_total',
+            'Total number of live order fills'
+        )
+
+        self.live_last_fill_price = Gauge(
+            'trading_live_last_fill_price',
+            'Price of the last filled order'
+        )
+
+        self.live_last_fill_cost = Gauge(
+            'trading_live_last_fill_cost',
+            'Cost of the last filled order in USD'
+        )
+
+        # Internal tracking
+        self._total_invested = 0.0
+        self._starting_balance_set = False
+        self._starting_balance_value = 0.0
+
         logger.info("Prometheus metrics initialized")
     
     def update_metrics(self) -> None:
@@ -358,7 +399,24 @@ class GrafanaMetricsExporter:
             # Set the exporter reference in the handler
             MetricsHandler.exporter = self
             
-            # Create and start custom HTTP server
+            # Kill any old process on the port, then start server
+            import signal as sig
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ['lsof', '-ti', f':{self.port}'],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for pid in result.stdout.strip().split('\n'):
+                    if pid and pid.isdigit() and int(pid) != os.getpid():
+                        os.kill(int(pid), sig.SIGTERM)
+                        logger.info(f"Killed old process {pid} on port {self.port}")
+                        import time; time.sleep(0.5)
+            except Exception:
+                pass
+
+            # Create HTTP server with port reuse
+            HTTPServer.allow_reuse_address = True
             self._server = HTTPServer(('0.0.0.0', self.port), MetricsHandler)
             self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
             self._thread.start()
@@ -422,6 +480,27 @@ class GrafanaMetricsExporter:
         """
         self.trade_duration.observe(duration_seconds)
     
+    def record_live_fill(self, price: float, qty: float, cost: float) -> None:
+        """Record a live order fill for P&L tracking."""
+        self._total_invested += cost
+        self.live_total_invested.set(self._total_invested)
+        self.live_fills_count.inc()
+        self.live_last_fill_price.set(price)
+        self.live_last_fill_cost.set(cost)
+        logger.info(f"[Grafana] Recorded fill: ${cost:.2f} @ ${price:.4f} | Total invested: ${self._total_invested:.2f}")
+
+    def update_live_balance(self, balance: float) -> None:
+        """Update the live account balance and compute P&L."""
+        if not self._starting_balance_set:
+            self._starting_balance_value = balance
+            self._starting_balance_set = True
+            self.live_starting_balance.set(balance)
+            logger.info(f"[Grafana] Starting balance set: ${balance:.2f}")
+
+        self.live_balance.set(balance)
+        pnl = balance - self._starting_balance_value
+        self.live_pnl.set(pnl)
+
     def increment_order_counter(self, status: str) -> None:
         """
         Increment order counter.
