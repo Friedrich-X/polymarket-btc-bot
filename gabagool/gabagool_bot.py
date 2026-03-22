@@ -23,6 +23,8 @@ from loguru import logger
 from dotenv import load_dotenv
 
 from gabagool.binance_feed import BinanceFeed
+from gabagool.coinbase_feed import CoinbaseFeed
+from gabagool.multi_feed import MultiFeedAggregator
 from gabagool.poly_client import GabagoolPolyClient
 from gabagool.paper_engine import PaperEngine
 from gabagool.strategies.momentum import MomentumStrategy
@@ -62,6 +64,8 @@ class GabagoolBot:
         self._paper_engine: PaperEngine | None = None
         self._trade_logger: TradeLogger | None = None
         self._binance_feed: BinanceFeed | None = None
+        self._coinbase_feed: CoinbaseFeed | None = None
+        self._multi_feed: MultiFeedAggregator | None = None
         self._momentum: MomentumStrategy | None = None
         self._spread_capture: SpreadCaptureStrategy | None = None
 
@@ -71,6 +75,7 @@ class GabagoolBot:
 
         # Async tasks
         self._binance_task: asyncio.Task | None = None
+        self._coinbase_task: asyncio.Task | None = None
         self._poll_task: asyncio.Task | None = None
         self._transition_task: asyncio.Task | None = None
 
@@ -149,13 +154,26 @@ class GabagoolBot:
             paper_mode=paper_mode,
         )
 
-        # 6. Start Binance WebSocket feed with momentum callback
+        # 6. Set up exchange feeds with multi-feed aggregator
         min_delta = momentum_config.get("entry_min_delta", 0.003)
         lookback = momentum_config.get("lookback_secs", 3)
+        feed_config = self.config.get("feeds", {})
+        feed_mode = feed_config.get("aggregation_mode", "confirm")
+        confirm_window = feed_config.get("confirmation_window_secs", 2.0)
+        coinbase_enabled = feed_config.get("coinbase_enabled", True)
 
+        # Create multi-feed aggregator that routes to momentum strategy
+        self._multi_feed = MultiFeedAggregator(
+            on_signal=self._momentum.on_signal,
+            mode=feed_mode,
+            confirmation_window_secs=confirm_window,
+            min_delta=min_delta,
+        )
+
+        # Binance feed (always enabled)
         self._binance_feed = BinanceFeed(
             symbol="btcusdt",
-            on_signal=self._momentum.on_signal,
+            on_signal=self._multi_feed.create_feed_callback("binance"),
             min_delta=min_delta,
             lookback_secs=lookback,
         )
@@ -164,21 +182,45 @@ class GabagoolBot:
             self._binance_feed.start(), name="binance_feed"
         )
 
+        # Coinbase feed (optional second data source)
+        all_tasks = [self._binance_task]
+
+        if coinbase_enabled:
+            self._coinbase_feed = CoinbaseFeed(
+                product_id="BTC-USD",
+                on_signal=self._multi_feed.create_feed_callback("coinbase"),
+                min_delta=min_delta,
+                lookback_secs=lookback,
+            )
+            self._coinbase_task = asyncio.create_task(
+                self._coinbase_feed.start(), name="coinbase_feed"
+            )
+            all_tasks.append(self._coinbase_task)
+            logger.info("Coinbase feed ENABLED (dual-exchange mode)")
+        else:
+            logger.info("Coinbase feed DISABLED (single-exchange mode)")
+
         # 7. Start polling loop (spread capture + resolutions)
         self._poll_task = asyncio.create_task(
             self._poll_loop(), name="poll_loop"
         )
+        all_tasks.append(self._poll_task)
 
         # 8. Schedule market transition
         self._transition_task = asyncio.create_task(
             self._transition_loop(), name="transition_loop"
         )
+        all_tasks.append(self._transition_task)
 
-        logger.info("Gabagool bot is running. Press Ctrl+C to stop.")
+        logger.info(
+            "Gabagool bot is running (feeds: Binance{}) | mode={} | Press Ctrl+C to stop.",
+            "+Coinbase" if coinbase_enabled else " only",
+            feed_mode,
+        )
 
         # Wait for all tasks; if any exits unexpectedly, shut down cleanly
         done, pending = await asyncio.wait(
-            [self._binance_task, self._poll_task, self._transition_task],
+            all_tasks,
             return_when=asyncio.FIRST_EXCEPTION,
         )
 
@@ -309,6 +351,11 @@ class GabagoolBot:
         momentum_cfg = self.config.get("momentum", {})
         spread_cfg = self.config.get("spread_capture", {})
         general_cfg = self.config.get("general", {})
+        feed_cfg = self.config.get("feeds", {})
+
+        coinbase_on = feed_cfg.get("coinbase_enabled", True)
+        feeds_str = "Binance + Coinbase" if coinbase_on else "Binance only"
+        agg_mode = feed_cfg.get("aggregation_mode", "confirm")
 
         banner = f"""
 ================================================================================
@@ -318,6 +365,10 @@ class GabagoolBot:
    Budget:         ${self.budget:.2f}
    Poll interval:  {general_cfg.get('poll_interval_ms', 500)}ms
    Market window:  {general_cfg.get('market_interval_secs', 300)}s ({general_cfg.get('market_interval_secs', 300) // 60} min)
+   ----
+   Feeds:          {feeds_str}
+     Aggregation:  {agg_mode}
+     Confirm win:  {feed_cfg.get('confirmation_window_secs', 2.0)}s
    ----
    Momentum:       {'ON' if momentum_cfg.get('enabled', True) else 'OFF'}
      min_delta:    {momentum_cfg.get('entry_min_delta', 0.003)}
@@ -390,6 +441,17 @@ class GabagoolBot:
                 f"g_profit=${s_stats['guaranteed_profit']:.4f}"
             )
 
+        # Multi-feed aggregator stats
+        if self._multi_feed is not None:
+            mf_stats = self._multi_feed.get_stats()
+            summary_lines.append(
+                f"   [feeds] mode={mf_stats['mode']} "
+                f"received={mf_stats['signals_received']} "
+                f"fired={mf_stats['signals_fired']} "
+                f"confirmed={mf_stats['confirmations']} "
+                f"diverged={mf_stats['divergences']}"
+            )
+
         # Paper engine balance
         if self._paper_engine is not None:
             portfolio = self._paper_engine.get_portfolio()
@@ -415,12 +477,14 @@ class GabagoolBot:
         self._running = False
         logger.info("Shutting down Gabagool bot...")
 
-        # Stop Binance feed
+        # Stop exchange feeds
         if self._binance_feed is not None:
             await self._binance_feed.stop()
+        if self._coinbase_feed is not None:
+            await self._coinbase_feed.stop()
 
         # Cancel async tasks
-        for task in [self._binance_task, self._poll_task, self._transition_task]:
+        for task in [self._binance_task, self._coinbase_task, self._poll_task, self._transition_task]:
             if task is not None and not task.done():
                 task.cancel()
                 try:

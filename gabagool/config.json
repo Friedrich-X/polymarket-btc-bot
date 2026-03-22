@@ -1,4 +1,9 @@
 {
+  "feeds": {
+    "coinbase_enabled": true,
+    "aggregation_mode": "confirm",
+    "confirmation_window_secs": 2.0
+  },
   "momentum": {
     "enabled": true,
     "lookback_secs": 3,
