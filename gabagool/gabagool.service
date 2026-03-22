@@ -1,0 +1,16 @@
+[Unit]
+Description=Gabagool Polymarket Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/Polymarket-BTC-15-Minute-Trading-Bot
+ExecStart=/home/pi/Polymarket-BTC-15-Minute-Trading-Bot/venv/bin/python3 -m gabagool.gabagool_bot
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

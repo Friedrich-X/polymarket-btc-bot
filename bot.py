@@ -237,6 +237,12 @@ class IntegratedBTCStrategy(Strategy):
         self._live_trades_count: int = 0
         self._live_fills: List[Dict] = []  # Track all live fills
 
+        # Resolution tracking — measure REAL win rate
+        self._pending_resolutions: List[Dict] = []  # Trades awaiting market resolution
+        self._resolved_trades: List[Dict] = []      # Completed trades with outcome
+        self._order_directions: Dict[str, str] = {} # order_id → direction ("long"/"short")
+        self._load_resolved_trades()
+
         self.test_mode = test_mode
 
         if test_mode:
@@ -750,6 +756,10 @@ class IntegratedBTCStrategy(Strategy):
 
                 self.run_in_executor(lambda: self._make_trading_decision_sync(float(mid_price)))
 
+            # Check for trade resolutions on every tick (lightweight)
+            if self._pending_resolutions:
+                self._check_resolutions()
+
         except Exception as e:
             logger.error(f"Error processing quote tick: {e}")
 
@@ -1131,6 +1141,9 @@ class IntegratedBTCStrategy(Strategy):
 
             self.submit_order(order)
 
+            # Store direction for resolution tracking when fill comes back
+            self._order_directions[unique_id] = direction
+
             logger.info(f"REAL ORDER SUBMITTED!")
             logger.info(f"  Order ID: {unique_id}")
             logger.info(f"  Direction: {trade_label}")
@@ -1279,6 +1292,20 @@ class IntegratedBTCStrategy(Strategy):
             self.grafana_exporter.increment_order_counter("filled")
             self.grafana_exporter.record_live_fill(fill_price, fill_qty, fill_cost)
 
+        # Register for resolution tracking
+        order_id_str = str(event.client_order_id)
+        direction = self._order_directions.pop(order_id_str, None)
+        if direction:
+            self._register_pending_trade(
+                direction=direction,
+                fill_price=fill_price,
+                fill_qty=fill_qty,
+                fill_cost=fill_cost,
+                order_id=order_id_str,
+            )
+        else:
+            logger.warning(f"[RESOLUTION] No direction found for order {order_id_str} — cannot track")
+
         self._track_order_event("filled")
 
     def on_order_denied(self, event):
@@ -1330,6 +1357,187 @@ class IntegratedBTCStrategy(Strategy):
                 logger.debug(f"Error processing balance event: {e}")
 
     # ------------------------------------------------------------------
+    # Resolution tracking — REAL win/loss measurement
+    # ------------------------------------------------------------------
+
+    def _load_resolved_trades(self):
+        """Load previously resolved trades from JSON file."""
+        import json
+        try:
+            with open('live_trades.json', 'r') as f:
+                data = json.load(f)
+                self._resolved_trades = data.get('resolved', [])
+                self._pending_resolutions = data.get('pending', [])
+                wins = sum(1 for t in self._resolved_trades if t['outcome'] == 'WIN')
+                total = len(self._resolved_trades)
+                logger.info(
+                    f"[RESOLUTION] Loaded {total} resolved trades "
+                    f"({wins} wins, {total - wins} losses, "
+                    f"{wins/total*100:.1f}% win rate)" if total > 0 else
+                    "[RESOLUTION] No previous trades found"
+                )
+                if self._pending_resolutions:
+                    logger.info(f"[RESOLUTION] {len(self._pending_resolutions)} trades pending resolution")
+        except FileNotFoundError:
+            logger.info("[RESOLUTION] No live_trades.json yet — starting fresh")
+        except Exception as e:
+            logger.warning(f"[RESOLUTION] Failed to load trades: {e}")
+
+    def _save_live_trades(self):
+        """Save all trade data to JSON file."""
+        import json
+        try:
+            data = {
+                'pending': self._pending_resolutions,
+                'resolved': self._resolved_trades,
+                'summary': self._get_resolution_summary(),
+            }
+            with open('live_trades.json', 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"[RESOLUTION] Failed to save trades: {e}")
+
+    def _register_pending_trade(self, direction: str, fill_price: float,
+                                 fill_qty: float, fill_cost: float,
+                                 order_id: str):
+        """Register a filled trade for resolution tracking."""
+        now = datetime.now(timezone.utc)
+
+        # Calculate when this 15-min market resolves
+        # Markets resolve on 15-min UTC boundaries
+        current_ts = now.timestamp()
+        interval_end_ts = (math.floor(current_ts / MARKET_INTERVAL_SECONDS) + 1) * MARKET_INTERVAL_SECONDS
+        resolve_at = datetime.fromtimestamp(interval_end_ts, tz=timezone.utc)
+
+        # Determine which token was bought
+        token_side = "YES" if direction == "long" else "NO"
+
+        # Calculate breakeven accuracy needed
+        if token_side == "YES":
+            potential_profit = 1.0 - fill_price
+            potential_loss = fill_price
+        else:
+            potential_profit = 1.0 - (1.0 - fill_price)  # NO price = 1 - YES price
+            potential_loss = 1.0 - fill_price
+
+        trade = {
+            'order_id': order_id,
+            'timestamp': now.isoformat(),
+            'direction': direction,
+            'token_side': token_side,
+            'fill_price': fill_price,
+            'fill_qty': fill_qty,
+            'fill_cost': fill_cost,
+            'resolve_at': resolve_at.isoformat(),
+            'resolve_at_ts': interval_end_ts,
+            'potential_profit_per_token': round(potential_profit, 4),
+            'potential_loss_per_token': round(potential_loss, 4),
+            'breakeven_accuracy': round(potential_loss / (potential_profit + potential_loss) * 100, 1),
+            'outcome': 'PENDING',
+        }
+
+        self._pending_resolutions.append(trade)
+        self._save_live_trades()
+
+        logger.info("=" * 80)
+        logger.info(f"[RESOLUTION] Trade registered for tracking")
+        logger.info(f"  Token: {token_side} @ ${fill_price:.4f}")
+        logger.info(f"  Cost: ${fill_cost:.2f}")
+        logger.info(f"  Profit if WIN: ${potential_profit:.4f}/token")
+        logger.info(f"  Loss if LOSE: ${potential_loss:.4f}/token")
+        logger.info(f"  Breakeven accuracy: {trade['breakeven_accuracy']}%")
+        logger.info(f"  Resolves at: {resolve_at.strftime('%H:%M:%S')} UTC")
+        logger.info("=" * 80)
+
+    def _check_resolutions(self):
+        """Check if any pending trades have resolved. Call this on each tick."""
+        if not self._pending_resolutions:
+            return
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        still_pending = []
+
+        for trade in self._pending_resolutions:
+            if now_ts < trade['resolve_at_ts'] + 30:  # 30s grace period
+                still_pending.append(trade)
+                continue
+
+            # Market has resolved — determine outcome from latest price
+            # After resolution, YES token = $1.00 if BTC went up, $0.00 if down
+            # We can infer from the current mid_price if the market has resolved
+            # But simplest: check if we have a price near 0 or 1
+            last_price = float(self.price_history[-1]) if self.price_history else None
+
+            if last_price is not None and (last_price > 0.95 or last_price < 0.05):
+                # Market clearly resolved
+                btc_went_up = last_price > 0.50
+
+                if trade['token_side'] == 'YES':
+                    won = btc_went_up
+                    payout = trade['fill_qty'] * 1.0 if won else 0.0
+                else:
+                    won = not btc_went_up
+                    payout = trade['fill_qty'] * 1.0 if won else 0.0
+
+                trade['outcome'] = 'WIN' if won else 'LOSS'
+                trade['resolved_at'] = datetime.now(timezone.utc).isoformat()
+                trade['resolved_price'] = last_price
+                trade['payout'] = round(payout, 4)
+                trade['pnl'] = round(payout - trade['fill_cost'], 4)
+
+                self._resolved_trades.append(trade)
+
+                summary = self._get_resolution_summary()
+                logger.info("=" * 80)
+                logger.info(f"[RESOLUTION] Trade RESOLVED: {trade['outcome']}")
+                logger.info(f"  Token: {trade['token_side']} @ ${trade['fill_price']:.4f}")
+                logger.info(f"  P&L: ${trade['pnl']:+.4f}")
+                logger.info(f"  Overall: {summary['wins']}W / {summary['losses']}L "
+                            f"({summary['win_rate']:.1f}%) | "
+                            f"Net P&L: ${summary['net_pnl']:+.2f}")
+                logger.info("=" * 80)
+            else:
+                # Price not near 0/1 yet — might be next market already
+                # Fallback: if >2 minutes past resolve time, use last known direction
+                if now_ts > trade['resolve_at_ts'] + 120:
+                    logger.warning(
+                        f"[RESOLUTION] Trade {trade['order_id']} expired without clear resolution "
+                        f"(last_price={last_price}) — marking as UNKNOWN"
+                    )
+                    trade['outcome'] = 'UNKNOWN'
+                    trade['resolved_at'] = datetime.now(timezone.utc).isoformat()
+                    trade['resolved_price'] = last_price
+                    trade['pnl'] = 0.0
+                    self._resolved_trades.append(trade)
+                else:
+                    still_pending.append(trade)
+
+        if len(still_pending) != len(self._pending_resolutions):
+            self._pending_resolutions = still_pending
+            self._save_live_trades()
+
+    def _get_resolution_summary(self) -> Dict:
+        """Get summary of all resolved trades."""
+        wins = sum(1 for t in self._resolved_trades if t['outcome'] == 'WIN')
+        losses = sum(1 for t in self._resolved_trades if t['outcome'] == 'LOSS')
+        unknown = sum(1 for t in self._resolved_trades if t['outcome'] == 'UNKNOWN')
+        total = wins + losses
+        net_pnl = sum(t.get('pnl', 0) for t in self._resolved_trades)
+        total_invested = sum(t.get('fill_cost', 0) for t in self._resolved_trades)
+
+        return {
+            'wins': wins,
+            'losses': losses,
+            'unknown': unknown,
+            'total': total,
+            'win_rate': (wins / total * 100) if total > 0 else 0.0,
+            'net_pnl': round(net_pnl, 4),
+            'total_invested': round(total_invested, 4),
+            'roi': round(net_pnl / total_invested * 100, 2) if total_invested > 0 else 0.0,
+            'pending': len(self._pending_resolutions),
+        }
+
+    # ------------------------------------------------------------------
     # Grafana / stop
     # ------------------------------------------------------------------
 
@@ -1346,6 +1554,19 @@ class IntegratedBTCStrategy(Strategy):
     def on_stop(self):
         logger.info("Integrated BTC strategy stopped")
         logger.info(f"Total paper trades recorded: {len(self.paper_trades)}")
+
+        # Save resolution data and print summary
+        self._save_live_trades()
+        summary = self._get_resolution_summary()
+        if summary['total'] > 0:
+            logger.info("=" * 80)
+            logger.info("[RESOLUTION] FINAL SESSION SUMMARY")
+            logger.info(f"  Wins: {summary['wins']} | Losses: {summary['losses']} | Unknown: {summary['unknown']}")
+            logger.info(f"  Win Rate: {summary['win_rate']:.1f}%")
+            logger.info(f"  Net P&L: ${summary['net_pnl']:+.2f}")
+            logger.info(f"  ROI: {summary['roi']:.1f}%")
+            logger.info(f"  Pending: {summary['pending']} trades awaiting resolution")
+            logger.info("=" * 80)
         if self.grafana_exporter:
             import asyncio
             try:

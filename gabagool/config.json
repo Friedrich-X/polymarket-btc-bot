@@ -1,0 +1,25 @@
+{
+  "momentum": {
+    "enabled": true,
+    "lookback_secs": 3,
+    "entry_min_delta": 0.003,
+    "cooldown_secs": 30,
+    "order_size_usd": 5.0,
+    "order_type": "FOK",
+    "max_trades_per_window": 5
+  },
+  "spread_capture": {
+    "enabled": true,
+    "spread_threshold": 0.96,
+    "order_size_usd": 5.0,
+    "order_type": "GTC",
+    "max_imbalance_ratio": 1.5,
+    "cooldown_secs": 10
+  },
+  "general": {
+    "budget_usd": 60.0,
+    "market_interval_secs": 900,
+    "log_file": "gabagool_trades.json",
+    "poll_interval_ms": 500
+  }
+}
