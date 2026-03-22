@@ -14,7 +14,7 @@ from typing import Optional
 from loguru import logger
 
 
-MARKET_INTERVAL_SECS = 900  # 15 minutes
+MARKET_INTERVAL_SECS = 300  # 5 minutes (default)
 RESOLUTION_GRACE_SECS = 30
 RESOLUTION_UNKNOWN_SECS = 120  # Mark UNKNOWN if still unclear after this
 YES_WIN_THRESHOLD = 0.95

@@ -30,17 +30,17 @@ from gabagool.strategies.spread_capture import SpreadCaptureStrategy
 from gabagool.trade_logger import TradeLogger
 
 
-MARKET_INTERVAL_SECS = 900  # 15 minutes
+MARKET_INTERVAL_SECS = 300  # 5 minutes (default, loaded from config)
 
 
-def _seconds_until_next_boundary() -> float:
-    """Calculate seconds until the next 15-minute clock boundary."""
+def _seconds_until_next_boundary(interval: int = MARKET_INTERVAL_SECS) -> float:
+    """Calculate seconds until the next market clock boundary."""
     now = time.time()
-    next_boundary = math.ceil(now / MARKET_INTERVAL_SECS) * MARKET_INTERVAL_SECS
+    next_boundary = math.ceil(now / interval) * interval
     remaining = next_boundary - now
-    # If we are exactly on a boundary, the next one is 15 minutes away
+    # If we are exactly on a boundary, the next one is one interval away
     if remaining < 1.0:
-        remaining = MARKET_INTERVAL_SECS
+        remaining = interval
     return remaining
 
 
@@ -89,7 +89,8 @@ class GabagoolBot:
         self._trade_logger = TradeLogger(log_file=log_file)
 
         # 2. Initialise Polymarket client (always needed for real price data)
-        self._poly_client = GabagoolPolyClient(live=self.live)
+        interval = self._config.get("general", {}).get("market_interval_secs", 300)
+        self._poly_client = GabagoolPolyClient(live=self.live, interval_secs=interval)
         if not self.live:
             # In paper mode the client still needs to connect for read-only
             # operations (market discovery, orderbook). connect() requires
@@ -236,7 +237,8 @@ class GabagoolBot:
         transition. Repeats indefinitely while the bot is running.
         """
         while self._running:
-            wait_secs = _seconds_until_next_boundary()
+            interval = self._config.get("general", {}).get("market_interval_secs", 300)
+            wait_secs = _seconds_until_next_boundary(interval)
             logger.info(
                 "Next market transition in {:.0f}s ({:.1f} min)",
                 wait_secs,
@@ -315,7 +317,7 @@ class GabagoolBot:
    Mode:           {mode}
    Budget:         ${self.budget:.2f}
    Poll interval:  {general_cfg.get('poll_interval_ms', 500)}ms
-   Market window:  {general_cfg.get('market_interval_secs', 900)}s (15 min)
+   Market window:  {general_cfg.get('market_interval_secs', 300)}s ({general_cfg.get('market_interval_secs', 300) // 60} min)
    ----
    Momentum:       {'ON' if momentum_cfg.get('enabled', True) else 'OFF'}
      min_delta:    {momentum_cfg.get('entry_min_delta', 0.003)}

@@ -33,20 +33,29 @@ from py_clob_client.constants import POLYGON
 
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
-MARKET_INTERVAL_SECS = 900  # 15 minutes
+MARKET_INTERVAL_SECS = 300  # 5 minutes (default, overridden by config)
+
+# Map interval to slug prefix
+_SLUG_PREFIXES = {
+    300: "btc-updown-5m",
+    900: "btc-updown-15m",
+    3600: "btc-updown-1h",
+}
 
 
-def _current_market_slug() -> str:
-    """Build the slug for the current BTC 15-min market window."""
+def _current_market_slug(interval_secs: int = MARKET_INTERVAL_SECS) -> str:
+    """Build the slug for the current BTC market window."""
     now_unix = int(time.time())
-    window_ts = (now_unix // MARKET_INTERVAL_SECS) * MARKET_INTERVAL_SECS
-    return f"btc-updown-15m-{window_ts}"
+    window_ts = (now_unix // interval_secs) * interval_secs
+    prefix = _SLUG_PREFIXES.get(interval_secs, f"btc-updown-{interval_secs // 60}m")
+    return f"{prefix}-{window_ts}"
 
 
 class GabagoolPolyClient:
-    """Polymarket CLOB client tailored for the Gabagool BTC 15-min bot."""
+    """Polymarket CLOB client tailored for the Gabagool BTC bot."""
 
-    def __init__(self, live: bool = False) -> None:
+    def __init__(self, live: bool = False, interval_secs: int = 300) -> None:
+        self._interval_secs = interval_secs
         """
         Initialise the client.
 
@@ -123,7 +132,7 @@ class GabagoolPolyClient:
 
         Returns ``None`` when no matching market is found.
         """
-        slug = _current_market_slug()
+        slug = _current_market_slug(self._interval_secs)
 
         # Return cached result if the window hasn't changed
         if self._market is not None and self._market_slug == slug:
