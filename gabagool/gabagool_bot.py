@@ -89,7 +89,7 @@ class GabagoolBot:
         self._trade_logger = TradeLogger(log_file=log_file)
 
         # 2. Initialise Polymarket client (always needed for real price data)
-        interval = self._config.get("general", {}).get("market_interval_secs", 300)
+        interval = self.config.get("general", {}).get("market_interval_secs", 300)
         self._poly_client = GabagoolPolyClient(live=self.live, interval_secs=interval)
         if not self.live:
             # In paper mode the client still needs to connect for read-only
@@ -237,7 +237,7 @@ class GabagoolBot:
         transition. Repeats indefinitely while the bot is running.
         """
         while self._running:
-            interval = self._config.get("general", {}).get("market_interval_secs", 300)
+            interval = self.config.get("general", {}).get("market_interval_secs", 300)
             wait_secs = _seconds_until_next_boundary(interval)
             logger.info(
                 "Next market transition in {:.0f}s ({:.1f} min)",
