@@ -906,8 +906,8 @@ class IntegratedBTCStrategy(Strategy):
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
         )
 
-        # --- Phase 5: Position size is always exactly $2.00 ---
-        POSITION_SIZE_USD = Decimal("2.00")
+        # --- Phase 5: Position size from .env (default $2.00) ---
+        POSITION_SIZE_USD = Decimal(os.getenv("MAX_POSITION_SIZE", "2.0"))
 
         # =========================================================================
         # TREND FILTER — replaces signal-based direction at the late trade window
@@ -957,7 +957,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Risk engine blocked trade: {error}")
             return
 
-        logger.info(f"Position size: $2.00 (fixed) | Direction: {direction.upper()}")
+        logger.info(f"Position size: ${POSITION_SIZE_USD} (from .env) | Direction: {direction.upper()}")
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
