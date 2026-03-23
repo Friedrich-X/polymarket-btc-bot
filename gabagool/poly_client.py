@@ -233,18 +233,23 @@ class GabagoolPolyClient:
             }
         """
         self._require_client()
-        try:
-            book = self._client.get_order_book(token_id)  # type: ignore[union-attr]
-            bids = [
-                (float(entry.price), float(entry.size)) for entry in (book.bids or [])
-            ]
-            asks = [
-                (float(entry.price), float(entry.size)) for entry in (book.asks or [])
-            ]
-            return {"bids": bids, "asks": asks}
-        except Exception:
-            logger.exception("Failed to fetch order book for token_id={}", token_id)
-            return {"bids": [], "asks": []}
+        for attempt in range(3):
+            try:
+                book = self._client.get_order_book(token_id)  # type: ignore[union-attr]
+                bids = [
+                    (float(entry.price), float(entry.size)) for entry in (book.bids or [])
+                ]
+                asks = [
+                    (float(entry.price), float(entry.size)) for entry in (book.asks or [])
+                ]
+                return {"bids": bids, "asks": asks}
+            except Exception as exc:
+                if attempt < 2:
+                    logger.debug("Order book fetch failed (attempt {}), retrying: {}", attempt + 1, exc)
+                    time.sleep(0.3)
+                else:
+                    logger.warning("Failed to fetch order book after 3 attempts: {}", exc)
+        return {"bids": [], "asks": []}
 
     def get_best_prices(self) -> dict[str, float | None]:
         """

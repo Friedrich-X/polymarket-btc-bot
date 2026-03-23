@@ -25,6 +25,6 @@
     "budget_usd": 60.0,
     "market_interval_secs": 300,
     "log_file": "gabagool_trades.json",
-    "poll_interval_ms": 500
+    "poll_interval_ms": 1000
   }
 }
